@@ -48,7 +48,7 @@ def _prepare_data_to_token(df,tokenizer,args,ids_array):
             prediction_label = row["discourse_type"]
             text_labels[discourse_start:discourse_end] = [1] * (discourse_end - discourse_start)
             target_idx = []
-            for map_idx, (offset1, offset2) in tqdm(enumerate(offset_mapping)):
+            for map_idx, (offset1, offset2) in enumerate(offset_mapping):
                 if sum(text_labels[offset1:offset2]) > 0:                             # The text from charpos1 - 2 contains Entity or not
                     if len(text[offset1:offset2].split()) > 0:                       # The text from charpos1 - 2 contains a word or not 
                         target_idx.append(map_idx)
@@ -58,12 +58,12 @@ def _prepare_data_to_token(df,tokenizer,args,ids_array):
             input_labels[target_start+1:target_end+1] = [label_in] * (target_end - target_start)
         sample['input_labels'] = input_labels
         sample["input_ids"] = input_token
-    training_samples.append(sample)        
+        training_samples.append(sample)        
     return training_samples
 
 def data_to_token(df,tokenizer,args,num_jobs):
     training_sample = []
-    text_ids = df.id.unique()[:5]
+    text_ids = df.id.unique()
     text_ids_split = np.array_split(text_ids,num_jobs)
     results = Parallel(n_jobs=num_jobs)(delayed(_prepare_data_to_token)(df,tokenizer,args,ids_array) for ids_array in text_ids_split)
     for i in results:

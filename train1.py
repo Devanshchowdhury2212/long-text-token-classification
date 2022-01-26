@@ -18,6 +18,7 @@ def arg_passer():# Token,, Directory
     parser = argparse.ArgumentParser()
     parser.add_argument('--model',default='allenai/longformer-large-4096',type = str,required=False)
     parser.add_argument("--num_labels", type=int, required=True)
+    parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--output", type=str,default='model', required=True)
     parser.add_argument("--fold", type=int, required=True)
     parser.add_argument('--file_dir',default='../train',type = str,required=False)
@@ -25,6 +26,7 @@ def arg_passer():# Token,, Directory
     parser.add_argument('--max_length',default=1024,type = int,required=False)
     parser.add_argument('--stride',default=128,type = int,required=False)
     parser.add_argument("--batch_size", type=int, default=4, required=False)
+    parser.add_argument("--valid_batch_size", type=int, default=4, required=False)
     parser.add_argument("--accumulation_steps", type=int, default=2, required=False) # 8/batch_size
     parser.add_argument("--epochs", type=int, default=1, required=False)
     return parser.parse_args()
@@ -42,8 +44,8 @@ class FeedbackDataset:
         return self.length
 
     def __getitem__(self,idx):
-        input_ids = self.samples.idx['input_ids']
-        input_labels = self.samples.idx['input_labels']
+        input_ids = self.samples[idx]['input_ids']
+        input_labels = self.samples[idx]['input_labels']
         input_labels = [target_id_map[z] for z in input_labels]
         other_label_id = target_id_map["O"]
         padding_label_id = target_id_map["PAD"]
@@ -65,13 +67,13 @@ class FeedbackDataset:
             input_labels = input_labels + [padding_label_id] * pad_req 
             attention_mask = attention_mask + [0] * pad_req
         return {
-            "ids": torch.tensor(input_ids, dtype=torch.int),
-            "mask": torch.tensor(attention_mask, dtype=torch.int),
-            "targets": torch.tensor(input_labels, dtype=torch.int),
+            "ids": torch.tensor(input_ids, dtype=torch.long),
+            "mask": torch.tensor(attention_mask, dtype=torch.long),
+            "targets": torch.tensor(input_labels, dtype=torch.long),
         }
 
 class FeedbackModel(tez.Model):
-    def __init__(self, model_name,epochs,lr,batch_size,num_labels,steps_pr_epoch,num_warmup_steps):
+    def __init__(self, model_name,epochs,lr,batch_size,num_labels,steps_pr_epoch,num_train_steps):
         super().__init__()
         self.epochs = epochs
         self.batch_size = batch_size
@@ -79,7 +81,7 @@ class FeedbackModel(tez.Model):
         self.model_name = model_name
         self.lr = lr
         self.steps_pr_epoch = steps_pr_epoch
-        self.num_warmup_steps = num_warmup_steps
+        self.num_train_steps = num_train_steps
 
         hidden_dropout_prob = 0.1
         layer_norm_eps  = 1e-6
@@ -130,24 +132,24 @@ class FeedbackModel(tez.Model):
     def fetch_scheduler(self):
         # create your own scheduler
         sch = get_cosine_schedule_with_warmup(
-            self.optimizer,num_warmup = int(.1*self.num_warmup_steps), num_training_steps = self.num_warmup_steps,num_cycles = 1,
+            self.optimizer,num_warmup_steps  = int(.1*self.num_train_steps), num_training_steps = self.num_train_steps,num_cycles = 1,
             last_epoch  = -1)
         return sch
 
     def fetch_optimizer(self):
         # create your own optimizer
-        params_optimizers = list(self.model.named_parameters())
+        params_optimizers = list(self.named_parameters())
         no_decay = ["bias", "LayerNorm.bias"]
         optimizer_parameters = [
-            {'params':[n for n, p in params_optimizers if not any(nd in n for nd in no_decay)],'weight_decay':.001},
-            {'params':[n for n, p in params_optimizers if any(nd in n for nd in no_decay)],'weight_decay':0}
+            {'params':[p for n, p in params_optimizers if not any(nd in n for nd in no_decay)],'weight_decay':.001},
+            {'params':[p for n, p in params_optimizers if any(nd in n for nd in no_decay)],'weight_decay':0}
         ]
-        opt = AdamW(optimizer_parameters,lr=self.learning_rate)
+        opt = AdamW(optimizer_parameters,lr=self.lr)
         return opt
 
-    def forward(self, ids, masks, token_type_ids = None, targets=None):
+    def forward(self, ids, mask, token_type_ids = None, targets=None):
         if token_type_ids == None:
-            transformer_out = self.transformer(ids,masks)
+            transformer_out = self.transformer(ids,mask)
         sequence_output = transformer_out.last_hidden_state
         sequence_output = self.dropout(sequence_output)
         l1 = self.linear(self.dropout1(sequence_output))
@@ -159,23 +161,25 @@ class FeedbackModel(tez.Model):
         logits = torch.softmax(l_avg,dim=-1)
         loss = 0
         if targets is not None:
-            loss1  = self.loss(l1,targets,masks)
-            loss2  = self.loss(l2,targets,masks)
-            loss3  = self.loss(l3,targets,masks)
-            loss4  = self.loss(l4,targets,masks)
-            loss5  = self.loss(l5,targets,masks)
+            loss1  = self.loss(l1,targets,mask)
+            loss2  = self.loss(l2,targets,mask)
+            loss3  = self.loss(l3,targets,mask)
+            loss4  = self.loss(l4,targets,mask)
+            loss5  = self.loss(l5,targets,mask)
             loss = (loss1+loss2+loss3+loss4+loss5)/5
-            f1_1  = self.monitor_metrics(l1,targets,masks)
-            f1_2  = self.monitor_metrics(l2,targets,masks)
-            f1_3  = self.monitor_metrics(l3,targets,masks)
-            f1_4  = self.monitor_metrics(l4,targets,masks)
-            f1_5  = self.monitor_metrics(l5,targets,masks)
+            f1_1  = self.monitor_metrics(l1,targets,mask)['f1_score']
+            f1_2  = self.monitor_metrics(l2,targets,mask)['f1_score']
+            f1_3  = self.monitor_metrics(l3,targets,mask)['f1_score']
+            f1_4  = self.monitor_metrics(l4,targets,mask)['f1_score']
+            f1_5  = self.monitor_metrics(l5,targets,mask)['f1_score']
             f1 = (f1_1+f1_2+f1_3+f1_4+f1_5)/5
             return logits,loss,{'f1':f1}
         return logits,loss,{}
 
 if __name__ == '__main__':
-    num_jobs = 12
+    num_jobs = 15 
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
     args = arg_passer()
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     df = pd.read_csv(args.csv)
@@ -185,19 +189,19 @@ if __name__ == '__main__':
         if enum == args.fold:
             df_train = df.loc[tr_idx]
             df_val = df.loc[val_idx]
-            print(len(df_train))
     training_samples = data_to_token(df_train,tokenizer,args,num_jobs = num_jobs)
     valid_samples = data_to_token(df_val,tokenizer,args,num_jobs = num_jobs)
-
     training_dataset = FeedbackDataset(training_samples,tokenizer,args.max_length)
     num_train_steps = int(len(training_dataset) / args.batch_size / args.accumulation_steps * args.epochs)
+    print("Training Data",len(training_dataset))
     model = FeedbackModel(
         model_name = args.model,
         epochs = args.epochs,
         lr = args.lr,
         batch_size = args.batch_size,
         num_labels = args.num_labels,
-        steps_pr_epoch = len(training_dataset) / args.batch_size
+        steps_pr_epoch = len(training_dataset) / args.batch_size,
+        num_train_steps = num_train_steps
     )
     os.makedirs(args.output,exist_ok = True)
     es = EarlyStopping(

@@ -1,2 +1,5 @@
 longformer settings (../input/longformer-settings)  /model
 has train tokens target and other tokenizers
+
+
+python train1.py --fold 0 --num_labels 15 --output longmodel --lr 1e-5 --file_dir ../feedback-prize-2021/train --csv ../train.csv --max_length 1024 --stride 128 --batch_size 2
