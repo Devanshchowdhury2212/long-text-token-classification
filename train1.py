@@ -185,6 +185,7 @@ if __name__ == '__main__':
         if enum == args.fold:
             df_train = df.loc[tr_idx]
             df_val = df.loc[val_idx]
+            print(len(df_train))
     training_samples = data_to_token(df_train,tokenizer,args,num_jobs = num_jobs)
     valid_samples = data_to_token(df_val,tokenizer,args,num_jobs = num_jobs)
 
