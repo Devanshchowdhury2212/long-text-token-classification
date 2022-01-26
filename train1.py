@@ -180,7 +180,7 @@ if __name__ == '__main__':
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     df = pd.read_csv(args.csv)
     len_df = len(df)
-    kfold  = KFold(n_splits = 5,random_stae = 42,shuffle=True)
+    kfold  = KFold(n_splits = 5,random_state = 42,shuffle=True)
     for enum,(tr_idx,val_idx) in enumerate(kfold.split(range(len_df))):
         if enum == args.fold:
             df_train = df.loc[tr_idx]
