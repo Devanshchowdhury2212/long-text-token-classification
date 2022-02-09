@@ -1,119 +1,152 @@
 import argparse
-from re import S
-import numpy as np
 import os
-from sklearn import metrics
+import random
+import warnings
 
-from sklearn.metrics import f1_score
-from utils1 import data_to_token
-from transformers import AdamW, AutoConfig, AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup, get_linear_schedule_with_warmup
+import numpy as np
 import pandas as pd
-from utils1 import target_id_map,EarlyStopping
-import torch 
 import tez
+import torch
 import torch.nn as nn
-from sklearn.model_selection import KFold
+from sklearn import metrics
+from torch.nn import functional as F
+from transformers import AdamW, AutoConfig, AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
-def arg_passer():# Token,, Directory
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model',default='allenai/longformer-large-4096',type = str,required=False)
-    parser.add_argument("--num_labels", type=int, required=True)
-    parser.add_argument("--lr", type=float, required=True)
-    parser.add_argument("--output", type=str,default='model', required=True)
-    parser.add_argument("--fold", type=int, required=True)
-    parser.add_argument('--file_dir',default='../train',type = str,required=False)
-    parser.add_argument('--csv',default='../train.csv',type = str,required=False)
-    parser.add_argument('--max_length',default=1024,type = int,required=False)
-    parser.add_argument('--stride',default=128,type = int,required=False)
-    parser.add_argument("--batch_size", type=int, default=4, required=False)
-    parser.add_argument("--valid_batch_size", type=int, default=4, required=False)
-    parser.add_argument("--accumulation_steps", type=int, default=2, required=False) # 8/batch_size
-    parser.add_argument("--epochs", type=int, default=1, required=False)
-    return parser.parse_args()
+from utils1 import EarlyStopping, prepare_training_data, target_id_map
+
+warnings.filterwarnings("ignore")
+
+
+def seed_everything(seed: int):
+    random.seed(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = True
 
 
 
 class FeedbackDataset:
-    def __init__(self,samples,tokenizer,max_length):
+    def __init__(self, samples, max_len, tokenizer):
         self.samples = samples
+        self.max_len = max_len
         self.tokenizer = tokenizer
-        self.max_length = max_length
         self.length = len(samples)
 
     def __len__(self):
         return self.length
 
-    def __getitem__(self,idx):
-        input_ids = self.samples[idx]['input_ids']
-        input_labels = self.samples[idx]['input_labels']
-        input_labels = [target_id_map[z] for z in input_labels]
+    def __getitem__(self, idx):
+        input_ids = self.samples[idx]["input_ids"]
+        input_labels = self.samples[idx]["input_labels"]
+        input_labels = [target_id_map[x] for x in input_labels]
         other_label_id = target_id_map["O"]
         padding_label_id = target_id_map["PAD"]
-        # Add starting Token (0) and Starting Label
+        # print(input_ids)
+        # print(input_labels)
+
+        # add start token id to the input_ids
         input_ids = [self.tokenizer.cls_token_id] + input_ids
         input_labels = [other_label_id] + input_labels
 
-        if len(input_labels) > self.max_length-1:
-            input_ids = input_ids[:self.max_length-1]
-            input_labels = input_labels[:self.max_length-1]        
+        if len(input_ids) > self.max_len - 1:
+            input_ids = input_ids[: self.max_len - 1]
+            input_labels = input_labels[: self.max_len - 1]
 
-        input_ids =  input_ids + [self.tokenizer.eos_token_id] 
+        # add end token id to the input_ids
+        input_ids = input_ids + [self.tokenizer.sep_token_id]
         input_labels = input_labels + [other_label_id]
 
         attention_mask = [1] * len(input_ids)
-        pad_req = self.max_length - len(input_ids)
-        if pad_req >0:
-            input_ids = input_ids + [self.tokenizer.pad_token_id] * pad_req 
-            input_labels = input_labels + [padding_label_id] * pad_req 
-            attention_mask = attention_mask + [0] * pad_req
+
+        padding_length = self.max_len - len(input_ids)
+        if padding_length > 0:
+            if self.tokenizer.padding_side == "right":
+                input_ids = input_ids + [self.tokenizer.pad_token_id] * padding_length
+                input_labels = input_labels + [padding_label_id] * padding_length
+                attention_mask = attention_mask + [0] * padding_length
+            else:
+                input_ids = [self.tokenizer.pad_token_id] * padding_length + input_ids
+                input_labels = [padding_label_id] * padding_length + input_labels
+                attention_mask = [0] * padding_length + attention_mask
+
         return {
             "ids": torch.tensor(input_ids, dtype=torch.long),
             "mask": torch.tensor(attention_mask, dtype=torch.long),
             "targets": torch.tensor(input_labels, dtype=torch.long),
         }
 
+
 class FeedbackModel(tez.Model):
-    def __init__(self, model_name,epochs,lr,batch_size,num_labels,steps_pr_epoch,num_train_steps):
+    def __init__(self, model_name, num_train_steps, learning_rate, num_labels, steps_per_epoch):
         super().__init__()
-        self.epochs = epochs
-        self.batch_size = batch_size
-        self.num_labels = num_labels
+        self.learning_rate = learning_rate
         self.model_name = model_name
-        self.lr = lr
-        self.steps_pr_epoch = steps_pr_epoch
         self.num_train_steps = num_train_steps
+        self.num_labels = num_labels
+        self.steps_per_epoch = steps_per_epoch
+        self.step_scheduler_after = "batch"
 
-        hidden_dropout_prob = 0.1
-        layer_norm_eps  = 1e-6
+        hidden_dropout_prob: float = 0.1
+        layer_norm_eps: float = 1e-7
 
-        self.config = AutoConfig.from_pretrained(model_name)
-        self.config.update({
-            "output_hidden_states": True,
-            "hidden_dropout_prob": hidden_dropout_prob, #.1 o
-            "layer_norm_eps": layer_norm_eps,           #e-5 o
-            "add_pooling_layer": False,
-            "num_labels": self.num_labels,
-        })
+        config = AutoConfig.from_pretrained(model_name)
 
-        self.transformer = AutoModel.from_pretrained(model_name)
-        self.dropout = nn.Dropout(self.config.hidden_dropout_prob)
+        config.update(
+            {
+                "output_hidden_states": True,
+                "hidden_dropout_prob": hidden_dropout_prob,
+                "layer_norm_eps": layer_norm_eps,
+                "add_pooling_layer": False,
+                "num_labels": self.num_labels,
+            }
+        )
+        self.transformer = AutoModel.from_pretrained(model_name, config=config)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.dropout1 = nn.Dropout(0.1)
         self.dropout2 = nn.Dropout(0.2)
         self.dropout3 = nn.Dropout(0.3)
         self.dropout4 = nn.Dropout(0.4)
         self.dropout5 = nn.Dropout(0.5)
-        self.linear = nn.Linear(self.config.hidden_size,self.num_labels)
+        self.output = nn.Linear(config.hidden_size, self.num_labels)
 
-    def monitor_metrics(self, outputs, targets,attention_mask):
-        if targets is None:
-            return {}
-        active_loss = (attention_mask.view(-1) == 1).cpu().numpy()
-        active_pred = outputs.view(-1,self.num_labels)
-        gt = targets.view(-1).cpu().numpy()
-        outputs = active_pred.argmax(dim=-1).cpu().numpy()
-        idxs = np.where(active_loss == 1)[0]
-        f1_score = metrics.f1_score(gt[idxs],outputs[idxs],average='macro')
-        return {'f1_score':f1_score}
+    def fetch_optimizer(self):
+        global checkpoint
+        load_optimizer = True
+        param_optimizer = list(self.named_parameters())
+        no_decay = ["bias", "LayerNorm.bias"]
+        optimizer_parameters = [
+            {
+                "params": [p for n, p in param_optimizer if not any(nd in n for nd in no_decay)],
+                "weight_decay": 0.01,
+            },
+            {
+                "params": [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+                "weight_decay": 0.0,
+            },
+        ]
+        opt = AdamW(optimizer_parameters, lr=self.learning_rate)
+        if load_optimizer:
+          opt.load_state_dict(checkpoint['optimizer'])
+          print('Loaded Optimzers')
+        return opt
+
+    def fetch_scheduler(self):
+        global checkpoint
+        load_scheduler = True
+        sch = get_cosine_schedule_with_warmup(
+            self.optimizer,
+            num_warmup_steps=int(0.1 * self.num_train_steps),
+            num_training_steps=self.num_train_steps,
+            num_cycles=1,
+            last_epoch=-1,
+        )
+        if load_scheduler:
+          sch.load_state_dict(checkpoint['scheduler'])
+          print('Loaded Scheduler')
+        return sch
 
     def loss(self, outputs, targets, attention_mask):
         loss_fct = nn.CrossEntropyLoss()
@@ -129,99 +162,119 @@ class FeedbackModel(tez.Model):
         loss = loss_fct(active_logits, true_labels)
         return loss
 
-    def fetch_scheduler(self):
-        # create your own scheduler
-        sch = get_cosine_schedule_with_warmup(
-            self.optimizer,num_warmup_steps  = int(.1*self.num_train_steps), num_training_steps = self.num_train_steps,num_cycles = 1,
-            last_epoch  = -1)
-        return sch
+    def monitor_metrics(self, outputs, targets, attention_mask):
+        active_loss = (attention_mask.view(-1) == 1).cpu().numpy()
+        active_logits = outputs.view(-1, self.num_labels)
+        true_labels = targets.view(-1).cpu().numpy()
+        outputs = active_logits.argmax(dim=-1).cpu().numpy()
+        idxs = np.where(active_loss == 1)[0]
+        f1_score = metrics.f1_score(true_labels[idxs], outputs[idxs], average="macro")
+        return {"f1": f1_score}
 
-    def fetch_optimizer(self):
-        # create your own optimizer
-        params_optimizers = list(self.named_parameters())
-        no_decay = ["bias", "LayerNorm.bias"]
-        optimizer_parameters = [
-            {'params':[p for n, p in params_optimizers if not any(nd in n for nd in no_decay)],'weight_decay':.001},
-            {'params':[p for n, p in params_optimizers if any(nd in n for nd in no_decay)],'weight_decay':0}
-        ]
-        opt = AdamW(optimizer_parameters,lr=self.lr)
-        return opt
+    def forward(self, ids, mask, token_type_ids=None, targets=None):
 
-    def forward(self, ids, mask, token_type_ids = None, targets=None):
-        if token_type_ids == None:
-            transformer_out = self.transformer(ids,mask)
+        if token_type_ids:
+            transformer_out = self.transformer(ids, mask, token_type_ids)
+        else:
+            transformer_out = self.transformer(ids, mask)
         sequence_output = transformer_out.last_hidden_state
         sequence_output = self.dropout(sequence_output)
-        l1 = self.linear(self.dropout1(sequence_output))
-        l2 = self.linear(self.dropout2(sequence_output))
-        l3 = self.linear(self.dropout3(sequence_output))
-        l4 = self.linear(self.dropout4(sequence_output))
-        l5 = self.linear(self.dropout5(sequence_output))
-        l_avg = (l1+l2+l3+l4+l5)/5
-        logits = torch.softmax(l_avg,dim=-1)
-        loss = 0
-        if targets is not None:
-            loss1  = self.loss(l1,targets,mask)
-            loss2  = self.loss(l2,targets,mask)
-            loss3  = self.loss(l3,targets,mask)
-            loss4  = self.loss(l4,targets,mask)
-            loss5  = self.loss(l5,targets,mask)
-            loss = (loss1+loss2+loss3+loss4+loss5)/5
-            f1_1  = self.monitor_metrics(l1,targets,mask)['f1_score']
-            f1_2  = self.monitor_metrics(l2,targets,mask)['f1_score']
-            f1_3  = self.monitor_metrics(l3,targets,mask)['f1_score']
-            f1_4  = self.monitor_metrics(l4,targets,mask)['f1_score']
-            f1_5  = self.monitor_metrics(l5,targets,mask)['f1_score']
-            f1 = (f1_1+f1_2+f1_3+f1_4+f1_5)/5
-            return logits,loss,{'f1':f1}
-        return logits,loss,{}
 
-if __name__ == '__main__':
-    num_jobs = 15 
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
-    args = arg_passer()
+        logits1 = self.output(self.dropout1(sequence_output))
+        logits2 = self.output(self.dropout2(sequence_output))
+        logits3 = self.output(self.dropout3(sequence_output))
+        logits4 = self.output(self.dropout4(sequence_output))
+        logits5 = self.output(self.dropout5(sequence_output))
+
+        logits = (logits1 + logits2 + logits3 + logits4 + logits5) / 5
+        logits = torch.softmax(logits, dim=-1)
+        loss = 0
+
+        if targets is not None:
+            loss1 = self.loss(logits1, targets, attention_mask=mask)
+            loss2 = self.loss(logits2, targets, attention_mask=mask)
+            loss3 = self.loss(logits3, targets, attention_mask=mask)
+            loss4 = self.loss(logits4, targets, attention_mask=mask)
+            loss5 = self.loss(logits5, targets, attention_mask=mask)
+            loss = (loss1 + loss2 + loss3 + loss4 + loss5) / 5
+            f1_1 = self.monitor_metrics(logits1, targets, attention_mask=mask)["f1"]
+            f1_2 = self.monitor_metrics(logits2, targets, attention_mask=mask)["f1"]
+            f1_3 = self.monitor_metrics(logits3, targets, attention_mask=mask)["f1"]
+            f1_4 = self.monitor_metrics(logits4, targets, attention_mask=mask)["f1"]
+            f1_5 = self.monitor_metrics(logits5, targets, attention_mask=mask)["f1"]
+            f1 = (f1_1 + f1_2 + f1_3 + f1_4 + f1_5) / 5
+            metric = {"f1": f1}
+            return logits, loss, metric
+
+        return logits, loss, {}
+
+
+class args:
+  fold = 0
+  model = 'allenai/longformer-large-4096'
+  lr = 1e-5
+  output = '/content/model'
+  input = '/content/feedback/feedback-prize-2021'
+  max_len = 1024
+  batch_size = 1
+  valid_batch_size = 1
+  epochs = 8 # 20
+  accumulation_steps = 8
+  csv_input = '/content/fold_csv'
+  checkpoint = f'/content/drive/MyDrive/checkpoints/{fold}.pth.tar'
+  epoch_part = 1
+
+start_train = True
+if start_train:
+    NUM_JOBS = 12
+    # args = parse_args()  # Class is made to bypass this
+    seed_everything(42)
+    os.makedirs(args.output, exist_ok=True)
+    df = pd.read_csv(os.path.join(args.csv_input, "train_folds.csv")) # SAMPLE 1000 for wandb integration
+    train_df = df[df["kfold"] != args.fold].reset_index(drop=True)
+    valid_df = df[df["kfold"] == args.fold].reset_index(drop=True)
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    df = pd.read_csv(args.csv)
-    len_df = len(df)
-    kfold  = KFold(n_splits = 5,random_state = 42,shuffle=True)
-    for enum,(tr_idx,val_idx) in enumerate(kfold.split(range(len_df))):
-        if enum == args.fold:
-            df_train = df.loc[tr_idx]
-            df_val = df.loc[val_idx]
-    training_samples = data_to_token(df_train,tokenizer,args,num_jobs = num_jobs)
-    valid_samples = data_to_token(df_val,tokenizer,args,num_jobs = num_jobs)
-    training_dataset = FeedbackDataset(training_samples,tokenizer,args.max_length)
-    num_train_steps = int(len(training_dataset) / args.batch_size / args.accumulation_steps * args.epochs)
-    print("Training Data",len(training_dataset))
+    training_samples = prepare_training_data(train_df, tokenizer, args, num_jobs=NUM_JOBS)
+    valid_samples = prepare_training_data(valid_df, tokenizer, args, num_jobs=NUM_JOBS)
+
+    train_dataset = FeedbackDataset(training_samples, args.max_len, tokenizer)
+
+    num_train_steps = int(len(train_dataset) / args.batch_size / args.accumulation_steps * args.epochs)
+    print(num_train_steps)
+
     model = FeedbackModel(
-        model_name = args.model,
-        epochs = args.epochs,
-        lr = args.lr,
-        batch_size = args.batch_size,
-        num_labels = args.num_labels,
-        steps_pr_epoch = len(training_dataset) / args.batch_size,
-        num_train_steps = num_train_steps
+        model_name=args.model,
+        num_train_steps=num_train_steps,
+        learning_rate=args.lr,
+        num_labels=len(target_id_map) - 1,
+        steps_per_epoch=len(train_dataset) / args.batch_size,
     )
-    os.makedirs(args.output,exist_ok = True)
+
     es = EarlyStopping(
         model_path=os.path.join(args.output, f"model_{args.fold}.bin"),
-        valid_df=df_val,
-        valid_samples=valid_samples,
+        valid_df=valid_df,#valid_df
+        valid_samples=valid_samples,#valid_samples
         batch_size=args.valid_batch_size,
-        patience=5,
+        patience=3, # patience drop from 5 to 3
         mode="max",
         delta=0.001,
         save_weights_only=True,
-        tokenizer=tokenizer)
+        tokenizer=tokenizer,
+    )
+    checkpoint = torch.load(args.checkpoint)
+    model.load_state_dict(checkpoint['state_dict'])
+    print("Loaded Model Weights")
     model.fit(
-        training_dataset,
+        train_dataset,
         train_bs=args.batch_size,
         device="cuda",
         epochs=args.epochs,
         callbacks=[es],
         fp16=True,
-        accumulation_steps=args.accumulation_steps)
-    print('EXIT')
-
-    
+        accumulation_steps=args.accumulation_steps,
+    )
+    curr_state = checkpoint['epoch']
+    state = {'epoch': curr_state + args.epochs*args.epoch_part, 'state_dict': model.state_dict(),
+             'optimizer': model.optimizer.state_dict(), 'scheduler':model.scheduler.state_dict(),'metrics':model.metrics}
+    torch.save(state, args.checkpoint)
